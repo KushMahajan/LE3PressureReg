@@ -1,0 +1,511 @@
+import serial
+import time
+import numpy as np
+from vispy import app, scene
+import csv
+from datetime import datetime
+import os
+from collections import deque
+import struct
+
+app.use_app('glfw')
+
+class PressureMonitor:
+    def __init__(self, port='COM5', baudrate=115200, max_points=250):
+        # Reduce timeout for more responsive reading
+        self.ser = serial.Serial(port, baudrate, timeout=0.1)  # Reduced timeout
+        time.sleep(0.5)  # Reduced initial wait time
+
+        # Data storage with pre-allocated arrays
+        self.max_points = max_points
+        self.t = np.zeros(max_points, dtype=np.float32)  # Use float32 for better performance
+        self.upstream_pressure = np.zeros(max_points, dtype=np.float32)
+        self.downstream_pressure = np.zeros(max_points, dtype=np.float32)
+        self.pfuel = np.zeros(max_points, dtype=np.float32)
+        self.dp_dt = np.zeros(max_points, dtype=np.float32)
+        self.flow_rate = np.zeros(max_points, dtype=np.float32)
+        self.state = np.zeros(max_points, dtype=np.float32)
+        self.threshold = np.zeros(max_points, dtype=np.float32)
+        self.instability = np.zeros(max_points, dtype=np.float32)
+        self.data_index = 0
+        self.start_time = time.time()
+        
+        # Track update timing
+        self.last_plot_update = time.time()
+        self.last_csv_update = time.time()
+        self.plot_update_interval = 1  # 1Hz for plots
+        self.csv_update_interval = 0.01   # 100Hz for CSV
+        
+        # CSV buffering
+        self.csv_buffer = []
+        self.csv_buffer_size = 50
+        
+        # Create main window with Grid layout
+        self.canvas = scene.SceneCanvas(keys='interactive', 
+                                      title='System Monitoring Dashboard',
+                                      size=(1600, 1200),
+                                      show=True,
+                                      bgcolor='white')
+
+        # Setup visualization components (existing code remains the same)
+        grid = self.canvas.central_widget.add_grid(spacing=20)
+        # Set up plots
+        self.pressure_plot = grid.add_view(row=0, col=0)
+        self.flow_plot = grid.add_view(row=1, col=0)
+        self.derivative_plot = grid.add_view(row=2, col=0)
+        self.state_plot = grid.add_view(row=3, col=0)
+
+        # Add plot titles
+        self.add_plot_title(self.pressure_plot, "Pressure Measurements")
+        self.add_plot_title(self.flow_plot, "Flow Rate")
+        self.add_plot_title(self.derivative_plot, "Rate of Change & Instability")
+        self.add_plot_title(self.state_plot, "System State")
+
+        # Configure cameras
+        for plot in [self.pressure_plot, self.flow_plot, 
+                    self.derivative_plot, self.state_plot]:
+            plot.camera = scene.PanZoomCamera()
+            plot.camera.set_default_state()
+        self.setup_plot_lines()
+        self.setup_axes()
+        self.setup_csv()
+
+        # Faster update interval for data collection
+        self.timer = app.Timer(interval=0.01)  # 100Hz data collection
+        self.timer.connect(self.update)
+        self.timer.start()
+
+    def add_plot_title(self, plot, title):
+        title = scene.Label(title, color='black', font_size=12, pos=(plot.pos[0] + 10, plot.pos[1] + 10))
+        plot.add_widget(title)
+
+    def setup_plot_lines(self):
+        # Pressure plot lines
+        self.upstream_line = scene.Line(pos=np.zeros((self.max_points, 2)),
+                                      color='blue',
+                                      parent=self.pressure_plot.scene)
+        self.downstream_line = scene.Line(pos=np.zeros((self.max_points, 2)),
+                                        color='green',
+                                        parent=self.pressure_plot.scene)
+        self.pfuel_line = scene.Line(pos=np.zeros((self.max_points, 2)),
+                                   color='red',
+                                   parent=self.pressure_plot.scene)
+        self.threshold_line = scene.Line(pos=np.zeros((self.max_points, 2)),
+                                       color='purple',
+                                       parent=self.pressure_plot.scene)
+
+        # Flow plot
+        self.flow_line = scene.Line(pos=np.zeros((self.max_points, 2)),
+                                  color='orange',
+                                  parent=self.flow_plot.scene)
+
+        # Derivative plot
+        self.dpdt_line = scene.Line(pos=np.zeros((self.max_points, 2)),
+                                  color='darkred',
+                                  parent=self.derivative_plot.scene)
+        self.instability_line = scene.Line(pos=np.zeros((self.max_points, 2)),
+                                         color='darkblue',
+                                         parent=self.derivative_plot.scene)
+
+        # State plot
+        self.state_line = scene.Line(pos=np.zeros((self.max_points, 2)),
+                                   color='black',
+                                   parent=self.state_plot.scene)
+
+    def setup_axes(self):
+        """Setup axes for all plots with labels and tick handling"""
+        plots = [
+            (self.pressure_plot, 'Time (s)', 'Pressure (PSI)', (0, 400)),
+            (self.flow_plot, 'Time (s)', 'Flow Rate (L/min)', (0, 500000)),
+            (self.derivative_plot, 'Time (s)', 'Rate of Change & Instability', (-200, 200)),
+            (self.state_plot, 'Time (s)', 'System State', (-0.5, 2.5))
+        ]
+
+        for plot, x_label, y_label, y_range in plots:
+            try:
+                # Create axes
+                x_axis = scene.AxisWidget(
+                    orientation='bottom',
+                    text_color='black',
+                    axis_color='black',
+                    tick_color='black',
+                    tick_label_margin=5
+                )
+                y_axis = scene.AxisWidget(
+                    orientation='left',
+                    text_color='black',
+                    axis_color='black',
+                    tick_color='black',
+                    tick_label_margin=5
+                )
+                
+                # Configure axis properties
+                x_axis.stretch = (1, 0.1)
+                y_axis.stretch = (0.1, 1)
+                
+                # Add widgets to plot
+                plot.add_widget(x_axis)
+                plot.add_widget(y_axis)
+                
+                # Link views
+                x_axis.link_view(plot)
+                y_axis.link_view(plot)
+                
+                # Set labels
+                x_axis.axis.axis_label = x_label
+                y_axis.axis.axis_label = y_label
+                
+                # Set initial ranges
+                plot.camera.set_range(y=y_range)
+                
+                # Configure tick marks
+                y_axis.axis.domain = y_range
+                x_axis.axis.domain = (0, 100)  # Initial time range
+                
+                # Set major tick counts
+                y_axis.axis.major_tick_count = 5
+                x_axis.axis.major_tick_count = 5
+                
+            except Exception as e:
+                print(f"Error setting up axes: {e}")
+
+    
+    def setup_timers(self):
+        # Separate timers for different update frequencies
+        self.data_timer = app.Timer(interval=self.data_update_interval)
+        self.plot_timer = app.Timer(interval=self.plot_update_interval)
+        
+        self.data_timer.connect(self.update_data)
+        self.plot_timer.connect(self.update_plots)
+        
+        self.data_timer.start()
+        self.plot_timer.start()
+
+    def read_binary_data(self):
+        """Read binary data instead of text for efficiency"""
+        if self.ser.in_waiting >= self.packet_format.size:
+            data = self.ser.read(self.packet_format.size)
+            try:
+                return self.packet_format.unpack(data)
+            except struct.error:
+                return None
+        return None
+
+
+    """
+    def setup_legends(self):
+        """"""Setup legends for all plots""""""
+        # Add legend for pressure plot
+        legend_pressure = scene.Legend(
+            [
+                ('Upstream', 'blue'),
+                ('Downstream', 'green'),
+                ('P_fuel', 'red'),
+                ('Threshold', 'purple')
+            ],
+            parent=self.pressure_plot.scene,
+            offset=(10, 10)
+        )
+
+        # Add legend for flow plot
+        legend_flow = scene.Legend(
+            [('Flow Rate', 'orange')],
+            parent=self.flow_plot.scene,
+            offset=(10, 10)
+        )
+
+        # Add legend for derivative plot
+        legend_derivative = scene.Legend(
+            [
+                ('dP/dt', 'darkred'),
+                ('Instability', 'darkblue')
+            ],
+            parent=self.derivative_plot.scene,
+            offset=(10, 10)
+        )
+
+        # Add legend for state plot
+        legend_state = scene.Legend(
+            [('System State', 'black')],
+            parent=self.state_plot.scene,
+            offset=(10, 10)
+        )
+        """
+    def setup_csv(self):
+        """Initialize CSV file with headers"""
+        if not os.path.exists('data'):
+            os.makedirs('data')
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        self.csv_path = f'data/system_data_{timestamp}.csv'
+        with open(self.csv_path, 'w', newline='') as csvfile:
+            csv_writer = csv.writer(csvfile)
+            csv_writer.writerow(['Timestamp', 'Time (s)', 
+                               'Upstream Pressure', 'Downstream Pressure',
+                               'P_fuel', 'dP/dt', 'Flow Rate',
+                               'State', 'Threshold', 'Threshold_Up',
+                               'Instability', 'Control_Up', 'Control_Down'])
+
+    def parse_serial_data(self, line):
+        """Optimized parsing with less string operations"""
+        elapsed_time = time.time() - self.start_time
+        
+        try:
+            parts = {}
+            # Split once and iterate through segments
+            segments = line.split(',')
+            
+            for segment in segments:
+                if ':' in segment:
+                    # Split only once
+                    key, value = segment.split(':', 1)
+                    key = key.strip()
+                    value = value.strip()
+                    
+                    if 'Control_Status' in key:
+                        control_up = control_down = 0
+                        if 'Up(' in value:
+                            up_value = value[value.find('(')+1:value.find(')')]
+                            control_up = int(up_value)
+                        if 'Down(' in value:
+                            down_start = value.find('Down(') + 5
+                            down_end = value.find(')', down_start)
+                            control_down = int(value[down_start:down_end])
+                        parts['Control_Up'] = control_up
+                        parts['Control_Down'] = control_down
+                    elif key == 'State':
+                        parts[key] = value
+                    else:
+                        try:
+                            parts[key] = float(value)
+                        except ValueError:
+                            continue
+
+            # Map state string to numeric value using dict instead of if-else
+            state_map = {'NOMINAL': 0, 'RECOVERY': 1, 'OSCILLATION': 2}
+            numeric_state = state_map.get(parts.get('State', ''), 0)
+
+            return (elapsed_time,
+                    parts.get('Upstream Pressure', 0),
+                    parts.get('Downstream Pressure', 0),
+                    parts.get('P_fuel', 0),
+                    parts.get('dP/dt', 0),
+                    parts.get('Flow', 0),
+                    numeric_state,
+                    parts.get('Threshold', 0),
+                    parts.get('Threshold_Up', 0),
+                    parts.get('Instability', 0),
+                    parts.get('Control_Up', 0),
+                    parts.get('Control_Down', 0))
+
+        except Exception as e:
+            print(f"Error parsing data line: {e}")
+            return None
+
+    def update(self, event):
+        try:
+            current_time = time.time()
+            
+            # Always collect data at high frequency
+            if self.ser.in_waiting:
+                line = self.ser.readline().decode('utf-8').strip()
+                parsed_data = self.parse_serial_data(line)
+                
+                if parsed_data:
+                    self.update_data_arrays(parsed_data)
+                    
+                    # Buffer CSV data
+                    self.csv_buffer.append([datetime.now()] + list(parsed_data))
+                    
+                    # Write CSV buffer when full
+                    if len(self.csv_buffer) >= self.csv_buffer_size:
+                        self.write_csv_buffer()
+            
+            # Update plots at lower frequency
+            if current_time - self.last_plot_update >= self.plot_update_interval:
+                self.update_plots()
+                self.last_plot_update = current_time
+            
+            # Write remaining CSV data periodically
+            if current_time - self.last_csv_update >= self.csv_update_interval:
+                self.write_csv_buffer()
+                self.last_csv_update = current_time
+
+        except Exception as e:
+            print(f"Error in update: {e}")
+
+    def update_data_arrays(self, parsed_data):
+        """Efficient data array updating"""
+        if self.data_index >= self.max_points:
+            # Shift arrays efficiently using slicing
+            shift_size = self.max_points // 10  # Shift 10% of the array
+            self.t[:-shift_size] = self.t[shift_size:]
+            self.upstream_pressure[:-shift_size] = self.upstream_pressure[shift_size:]
+            self.downstream_pressure[:-shift_size] = self.downstream_pressure[shift_size:]
+            self.pfuel[:-shift_size] = self.pfuel[shift_size:]
+            self.dp_dt[:-shift_size] = self.dp_dt[shift_size:]
+            self.flow_rate[:-shift_size] = self.flow_rate[shift_size:]
+            self.state[:-shift_size] = self.state[shift_size:]
+            self.threshold[:-shift_size] = self.threshold[shift_size:]
+            self.instability[:-shift_size] = self.instability[shift_size:]
+            self.data_index = self.max_points - shift_size
+
+        # Store new values
+        idx = self.data_index
+        (self.t[idx], 
+         self.upstream_pressure[idx],
+         self.downstream_pressure[idx],
+         self.pfuel[idx],
+         self.dp_dt[idx],
+         self.flow_rate[idx],
+         self.state[idx],
+         self.threshold[idx],
+         _,  # threshold_up not stored
+         self.instability[idx],
+         _,  # control_up not stored
+         _   # control_down not stored
+        ) = parsed_data
+
+        self.data_index += 1
+    
+    def write_csv_buffer(self):
+        """Batch write CSV data"""
+        if self.csv_buffer:
+            with open(self.csv_path, 'a', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerows(self.csv_buffer)
+            self.csv_buffer = []
+
+    def update_plot_lines(self, valid_indices):
+        """Update all plot lines with current data and validation"""
+        try:
+            # Helper function to clean data
+            def clean_data(data):
+                return np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
+
+            # Update each line with cleaned data
+            self.upstream_line.set_data(pos=np.column_stack((
+                self.t[valid_indices], 
+                clean_data(self.upstream_pressure[valid_indices]))))
+            
+            self.downstream_line.set_data(pos=np.column_stack((
+                self.t[valid_indices], 
+                clean_data(self.downstream_pressure[valid_indices]))))
+            
+            self.pfuel_line.set_data(pos=np.column_stack((
+                self.t[valid_indices], 
+                clean_data(self.pfuel[valid_indices]))))
+            
+            self.threshold_line.set_data(pos=np.column_stack((
+                self.t[valid_indices], 
+                clean_data(self.threshold[valid_indices]))))
+            
+            self.flow_line.set_data(pos=np.column_stack((
+                self.t[valid_indices], 
+                clean_data(self.flow_rate[valid_indices]))))
+            
+            self.dpdt_line.set_data(pos=np.column_stack((
+                self.t[valid_indices], 
+                clean_data(self.dp_dt[valid_indices]))))
+            
+            self.instability_line.set_data(pos=np.column_stack((
+                self.t[valid_indices], 
+                clean_data(self.instability[valid_indices]))))
+            
+            self.state_line.set_data(pos=np.column_stack((
+                self.t[valid_indices], 
+                clean_data(self.state[valid_indices]))))
+                
+        except Exception as e:
+            print(f"Error updating plot lines: {e}")
+
+    def update_plot_ranges(self, valid_indices):
+        """Update the view ranges for all plots with validation"""
+        if self.data_index > 0:
+            try:
+                time_range = self.t[valid_indices]
+                x_range = (max(0, time_range[0]), max(time_range[-1], 1))
+                
+                # Helper function to get safe range
+                def get_safe_range(data, default_range):
+                    try:
+                        valid_data = data[~np.isnan(data) & ~np.isinf(data)]
+                        if len(valid_data) == 0:
+                            return default_range
+                        data_min = np.min(valid_data)
+                        data_max = np.max(valid_data)
+                        if data_min == data_max:
+                            margin = abs(data_max) * 0.1 or 1.0
+                            return (data_min - margin, data_max + margin)
+                        margin = (data_max - data_min) * 0.1
+                        return (data_min - margin, data_max + margin)
+                    except Exception:
+                        return default_range
+
+                # Pressure plot ranges
+                pressure_data = np.concatenate([
+                    self.upstream_pressure[valid_indices],
+                    self.downstream_pressure[valid_indices],
+                    self.pfuel[valid_indices]
+                ])
+                p_range = get_safe_range(pressure_data, (0, 400))
+                self.pressure_plot.camera.set_range(x=x_range, y=p_range)
+                
+                # Flow plot ranges
+                f_range = get_safe_range(self.flow_rate[valid_indices], (0, 500000))
+                self.flow_plot.camera.set_range(x=x_range, y=f_range)
+                
+                # Derivative plot ranges
+                derivative_data = np.concatenate([
+                    self.dp_dt[valid_indices],
+                    self.instability[valid_indices]
+                ])
+                d_range = get_safe_range(derivative_data, (-200, 200))
+                self.derivative_plot.camera.set_range(x=x_range, y=d_range)
+                
+                # State plot ranges - fixed range for states
+                self.state_plot.camera.set_range(x=x_range, y=(-0.5, 2.5))
+
+            except Exception as e:
+                print(f"Error updating plot ranges: {e}")
+    def update_plots(self):
+        """Update all plot lines efficiently"""
+        valid_indices = slice(0, self.data_index)
+        
+        # Update plot lines
+        self.update_plot_lines(valid_indices)
+        
+        # Update ranges less frequently
+        self.update_plot_ranges(valid_indices)
+        
+        # Force canvas update
+        self.canvas.update()
+
+    def cleanup(self):
+        """Enhanced cleanup"""
+        self.write_csv_buffer()  # Flush remaining CSV data
+        if hasattr(self, 'ser') and self.ser.is_open:
+            self.ser.close()
+        if hasattr(self, 'timer'):
+            self.timer.stop()
+
+    def __del__(self):
+        """Destructor to ensure cleanup"""
+        self.cleanup()
+
+def main():
+    try:
+        monitor = PressureMonitor(port='COM5', baudrate=115200)
+        app.run()
+    except serial.SerialException as e:
+        print(f"Error opening serial port: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\nClosing application...")
+    finally:
+        if 'monitor' in locals():
+            monitor.cleanup()
+
+if __name__ == '__main__':
+    import sys
+    main()
